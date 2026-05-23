@@ -23,21 +23,23 @@ FONT = (FONT_FAMILY, FONT_SIZE)
 FONT_BOLD = (FONT_FAMILY, FONT_SIZE, "bold")
 FONT_ITALIC = (FONT_FAMILY, FONT_SIZE, "italic")
 
-COLOR_BG = "#F0F0F0"
+COLOR_BG = "#F5F5F5"
 COLOR_EDITOR_BG = "#FFFFFF"
-COLOR_OUTPUT_BG = "#FAFAFA"
-COLOR_LINE_NUM_BG = "#F0F0F0"
-COLOR_LINE_NUM_FG = "#AAAAAA"
-COLOR_KEYWORD = "#0000FF"
-COLOR_STRING = "#008000"
-COLOR_NUMBER = "#800000"
-COLOR_COMMENT = "#808080"
-COLOR_PROMPT = "#000080"
-COLOR_ERROR = "#FF0000"
-COLOR_SUCCESS = "#006400"
-COLOR_TAB_BG = "#E8E8E8"
+COLOR_OUTPUT_BG = "#FCFCFC"
+COLOR_LINE_NUM_BG = "#F8F8F8"
+COLOR_LINE_NUM_FG = "#999999"
+COLOR_KEYWORD = "#1A1AE8"
+COLOR_STRING = "#228B22"
+COLOR_NUMBER = "#B22222"
+COLOR_COMMENT = "#5F9EA0"
+COLOR_PROMPT = "#C74634"
+COLOR_ERROR = "#D32F2F"
+COLOR_SUCCESS = "#2E7D32"
+COLOR_TAB_BG = "#ECECEC"
 COLOR_TAB_ACTIVE = "#FFFFFF"
-COLOR_STATUS_BG = "#D4D4D4"
+COLOR_STATUS_BG = "#E8E8E8"
+COLOR_ACCENT = "#C74634"
+COLOR_BORDER = "#D0D0D0"
 
 SQL_KEYWORDS = {
     'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET',
@@ -210,6 +212,7 @@ class ParsedStatement:
     insert_values: List[str] = field(default_factory=list)
     select_columns: List[str] = field(default_factory=list)
     from_tables: List[str] = field(default_factory=list)
+    from_subqueries: Dict[str, str] = field(default_factory=dict)  # placeholder_name -> subquery_sql
     where_clause: str = ""
     group_by: List[str] = field(default_factory=list)
     having_clause: str = ""
@@ -694,6 +697,49 @@ class SQLParser:
             else:
                 return stmt
         sql_keywords = {'WHERE', 'GROUP', 'HAVING', 'ORDER', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'JOIN', 'ON', 'CROSS', 'NATURAL'}
+        # Replace subqueries in FROM portion only (not in WHERE/HAVING/ORDER BY)
+        _subq_idx = [0]
+        def _replace_from_subqueries(text: str) -> str:
+            result = []
+            i = 0
+            while i < len(text):
+                if text[i] == '(' and i + 7 < len(text) and text[i+1:i+7].upper() == 'SELECT':
+                    depth = 1
+                    j = i + 1
+                    while j < len(text) and depth > 0:
+                        if text[j] == '(': depth += 1
+                        elif text[j] == ')': depth -= 1
+                        j += 1
+                    if depth == 0:
+                        subq_sql = text[i+1:j-1].strip()
+                        placeholder = f"__SUBQ_{_subq_idx[0]}"
+                        _subq_idx[0] += 1
+                        stmt.from_subqueries[placeholder] = subq_sql
+                        result.append(placeholder)
+                        i = j
+                        alias_match = re.match(r'\s+(?:AS\s+)?(\w+)', text[i:])
+                        if alias_match and alias_match.group(1).upper() not in sql_keywords:
+                            alias = alias_match.group(1).upper()
+                            stmt.table_aliases[placeholder] = alias
+                            i += alias_match.end()
+                        else:
+                            stmt.table_aliases[placeholder] = placeholder
+                        continue
+                result.append(text[i])
+                i += 1
+            return ''.join(result)
+        # Find the boundary of the FROM clause: everything up to WHERE/GROUP/HAVING/ORDER
+        from_end = len(remainder)
+        for kw_pos in re.finditer(r'\b(?:WHERE|GROUP|HAVING|ORDER)\b', remainder, re.IGNORECASE):
+            # Only stop at top-level keywords, not inside subqueries
+            prefix = remainder[:kw_pos.start()]
+            if prefix.count('(') == prefix.count(')'):
+                from_end = kw_pos.start()
+                break
+        from_portion = remainder[:from_end]
+        rest_portion = remainder[from_end:]
+        from_portion = _replace_from_subqueries(from_portion)
+        remainder = from_portion + rest_portion
         from_match = re.match(r'(\w+(?:\s+\w+)?(?:\s*,\s*\w+(?:\s+\w+)?)*)\s*', remainder, re.IGNORECASE | re.DOTALL)
         if from_match:
             raw_tables = from_match.group(1).strip()
@@ -755,11 +801,29 @@ class SQLParser:
         remainder = re.sub(
             r'(?:INNER\s+|LEFT\s+(?:OUTER\s+)?|RIGHT\s+(?:OUTER\s+)?|FULL\s+(?:OUTER\s+)?)?JOIN\s+\w+(?:\s+\w+)?(?:\s+ON\s+.*?)?(?=\s+(?:WHERE|GROUP|HAVING|ORDER|$)|$)',
             '', remainder, flags=re.IGNORECASE)
-        where_match = re.search(r'WHERE\s+(.*?)(?=\s+GROUP\s+BY\s+|\s+HAVING\s+|\s+ORDER\s+BY\s+|$)', remainder, re.IGNORECASE | re.DOTALL)
         where_parts = []
-        if where_match:
-            where_parts.append(where_match.group(1).strip())
-            remainder = remainder[where_match.end():]
+        where_m = re.search(r'WHERE\s+', remainder, re.IGNORECASE)
+        if where_m:
+            start = where_m.end()
+            depth = 0
+            i = start
+            while i < len(remainder):
+                c = remainder[i]
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                elif depth == 0:
+                    suffix = remainder[i:]
+                    if re.match(r'\s+GROUP\s+BY\s+', suffix, re.IGNORECASE):
+                        break
+                    if re.match(r'\s+HAVING\s+', suffix, re.IGNORECASE):
+                        break
+                    if re.match(r'\s+ORDER\s+BY\s+', suffix, re.IGNORECASE):
+                        break
+                i += 1
+            where_parts.append(remainder[start:i].strip())
+            remainder = remainder[:where_m.start()] + remainder[i:]
         if where_parts:
             stmt.where_clause = ' AND '.join(where_parts)
         group_match = re.search(r'GROUP\s+BY\s+(.*?)(?=\s+HAVING\s+|\s+ORDER\s+BY\s+|$)', remainder, re.IGNORECASE | re.DOTALL)
@@ -917,6 +981,7 @@ class MockDatabase:
         self.functions: Dict[str, FunctionInfo] = {}
         self.triggers: Dict[str, TriggerInfo] = {}
         self.sequences: Dict[str, SequenceInfo] = {}
+        self._last_sequence_nextvals: Dict[str, Optional[str]] = {}
         self.rownum_counter: int = 0
         self._undo_log: List[Tuple[str, str, int, List[str]]] = []
 
@@ -1234,6 +1299,34 @@ class MockDatabase:
                 expr = assign_match.group(2).strip().rstrip(';')
                 val = self._evaluate_plsql_expr(expr, variables)
                 variables[var_name] = val
+                i += 1
+                continue
+
+            # DML: INSERT, UPDATE, DELETE (e.g. trigger body)
+            dml_match = re.match(r'(INSERT|UPDATE|DELETE)\b', stmt, re.IGNORECASE)
+            if dml_match:
+                # Substitute :NEW/:OLD references and PL/SQL variables with actual values
+                subst = stmt
+                for var_key in sorted(variables.keys(), key=len, reverse=True):
+                    var_val = variables[var_key]
+                    if var_val.lstrip('-').replace('.', '', 1).isdigit():
+                        replacement = var_val
+                    else:
+                        replacement = "'" + var_val.replace("'", "''") + "'"
+                    if var_key.startswith(':'):
+                        subst = re.sub(re.escape(var_key), replacement, subst, flags=re.IGNORECASE)
+                    else:
+                        subst = re.sub(r'\b' + re.escape(var_key) + r'\b', replacement, subst, flags=re.IGNORECASE)
+                try:
+                    dml_parsed = SQLParser.parse(subst)
+                    if dml_parsed:
+                        dml_result = self.process_statement(dml_parsed)
+                        for line in dml_result:
+                            stripped = line.strip()
+                            if stripped:
+                                output_lines.append(stripped)
+                except Exception:
+                    pass
                 i += 1
                 continue
 
@@ -1574,8 +1667,10 @@ class MockDatabase:
                     row_count += 1
                 return ["", f"{row_count} row(s) inserted."]
 
-        values = [self._strip_quotes(v) for v in stmt.insert_values]
+        values = [self._resolve_sequence_ref(self._strip_quotes(v)) for v in stmt.insert_values]
         if stmt.insert_columns:
+            if len(stmt.insert_columns) != len(values):
+                return ["", f"ERROR at line 1: ORA-00947: not enough values"]
             ordered = [''] * len(cols)
             col_map = {c.upper(): i for i, c in enumerate(cols)}
             for ic, iv in zip(stmt.insert_columns, values):
@@ -1583,8 +1678,13 @@ class MockDatabase:
                     ordered[col_map[ic.upper()]] = iv
             row_data = {cols[i].upper(): ordered[i] for i in range(len(cols)) if i < len(ordered)}
         else:
+            if len(values) != len(cols):
+                if len(values) < len(cols):
+                    return ["", f"ERROR at line 1: ORA-00947: not enough values"]
+                else:
+                    return ["", f"ERROR at line 1: ORA-00913: too many values"]
             ordered = values[:len(cols)]
-            row_data = {cols[i].upper(): values[i] if i < len(values) else '' for i in range(len(cols))}
+            row_data = {cols[i].upper(): values[i] for i in range(len(cols))}
 
         # FK constraint validation
         fk_err = self._validate_fk(name, row_data)
@@ -1719,19 +1819,25 @@ class MockDatabase:
             return cols, rows
         if tname in self.views:
             view = self.views[tname]
-            # Execute the view's stored query against real tables
             parsed = SQLParser.parse(view.query)
             if parsed.type == StatementType.SELECT and parsed.from_tables:
+                # Complex views (JOIN, GROUP BY, aggregate, subquery) need full SELECT processing
+                has_joins = len(parsed.joins) > 0 or len(parsed.from_tables) > 1
+                has_agg = bool(parsed.group_by) or bool(parsed.having_clause) or \
+                    any(c.upper().startswith(('COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX('))
+                        for c in (parsed.select_columns or []))
+                has_subq = bool(parsed.from_subqueries)
+                if has_joins or has_agg or has_subq:
+                    lines = self._handle_SELECT(parsed)
+                    return self._parse_select_output_lines(lines)
                 base_table = parsed.from_tables[0].upper()
                 if base_table in self.tables:
                     base_cols = self.get_column_names(base_table)
                     base_rows = list(self.rows.get(base_table, []))
-                    # Determine which columns the view selects
                     if parsed.select_columns and parsed.select_columns[0].upper().strip() != '*':
                         cols = [c.strip() for c in parsed.select_columns]
                     else:
                         cols = list(base_cols)
-                    # Filter rows to only view-selected columns
                     if parsed.select_columns and parsed.select_columns[0].upper().strip() != '*':
                         col_indices = []
                         for sc in parsed.select_columns:
@@ -1748,7 +1854,6 @@ class MockDatabase:
                             rows.append(new_row)
                     else:
                         rows = [list(r) for r in base_rows]
-                    # Apply WHERE clause from view definition
                     if parsed.where_clause and rows:
                         filtered = []
                         for row in rows:
@@ -1863,21 +1968,52 @@ class MockDatabase:
 
         if not is_join:
             primary_table = stmt.from_tables[0].upper()
-            if primary_table not in self.tables and primary_table not in self.views:
+            _source_pre_aggregated = False
+            # Handle FROM subqueries (derived tables / inline views)
+            if primary_table in stmt.from_subqueries:
+                subq_sql = stmt.from_subqueries[primary_table]
+                subq_parsed = SQLParser.parse(subq_sql)
+                if subq_parsed.type != StatementType.SELECT:
+                    return ["", f"ERROR at line 1: ORA-00900: invalid subquery in FROM clause."]
+                subq_lines = self._handle_SELECT(subq_parsed)
+                table_cols, table_rows = self._parse_select_output_lines(subq_lines)
+                base_table_cols = table_cols
+                if subq_parsed.group_by or subq_parsed.having_clause or \
+                   any(c.upper().startswith(('COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX(')) for c in (subq_parsed.select_columns or [])):
+                    _source_pre_aggregated = True
+
+                # Determine columns to display
+                if stmt.select_columns and stmt.select_columns[0].upper().strip() not in ('*', 'ALL'):
+                    col_names = [self._strip_table_alias(sc) for sc in stmt.select_columns]
+                else:
+                    col_names = [c.upper() for c in table_cols]
+
+                all_data = [list(r) for r in table_rows]
+            elif primary_table not in self.tables and primary_table not in self.views:
                 return ["", f"ERROR at line 1: ORA-00942: table or view '{primary_table}' does not exist."]
-            table_cols, table_rows = self._gather_table_data(primary_table)
-            base_table_cols = table_cols
-
-            # Determine columns to display
-            if stmt.select_columns and stmt.select_columns[0].upper().strip() not in ('*', 'ALL'):
-                col_names = [self._strip_table_alias(sc) for sc in stmt.select_columns]
             else:
-                col_names = [c.upper() for c in table_cols]
+                table_cols, table_rows = self._gather_table_data(primary_table)
+                base_table_cols = table_cols
 
-            all_data = [list(r) for r in table_rows]
+                # Determine columns to display
+                if stmt.select_columns and stmt.select_columns[0].upper().strip() not in ('*', 'ALL'):
+                    col_names = [self._strip_table_alias(sc) for sc in stmt.select_columns]
+                else:
+                    col_names = [c.upper() for c in table_cols]
+
+                all_data = [list(r) for r in table_rows]
 
             # Compute has_agg early for flow control
             has_agg = any(c.upper().startswith(('COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX(')) for c in col_names)
+
+            # Don't re-apply aggregation for pre-aggregated sources (views or subqueries)
+            if _source_pre_aggregated:
+                has_agg = False
+            elif primary_table in self.views:
+                vp = SQLParser.parse(self.views[primary_table].query)
+                if vp.group_by or vp.having_clause or \
+                   any(c.upper().startswith(('COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX(')) for c in (vp.select_columns or [])):
+                    has_agg = False
 
             # Apply WHERE before column resolution or aggregates
             if stmt.where_clause and not is_join and all_data:
@@ -2339,7 +2475,25 @@ class MockDatabase:
                 c_part = c_up.split('.')[-1].strip()
                 if c_part == stripped_raw:
                     return i
+            # Handle "expr AS alias" column names
+            as_idx = c_up.find(' AS ')
+            if as_idx >= 0:
+                alias_part = c_up[as_idx + 4:].strip()
+                if alias_part == stripped_raw:
+                    return i
+                if '.' in alias_part:
+                    alias_bare = alias_part.split('.')[-1].strip()
+                    if alias_bare == stripped_raw:
+                        return i
         return -1
+
+    @staticmethod
+    def _is_numeric(s: str) -> bool:
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
 
     def _evaluate_simple(self, row: List[str], col_names: List[str],
                          table: str, condition: str) -> bool:
@@ -2363,10 +2517,19 @@ class MockDatabase:
                     return val == pat_upper
             return False
         # IN (including subqueries)
-        in_match = re.match(r"([\w.]+)\s+(?:NOT\s+)?IN\s*\(([^)]+)\)", cond, re.IGNORECASE | re.DOTALL)
+        in_match = re.match(r"([\w.]+)\s+(?:NOT\s+)?IN\s*\(", cond, re.IGNORECASE)
         if in_match:
             col = in_match.group(1).upper()
-            in_expr = in_match.group(2).strip()
+            start = in_match.end()
+            depth = 1
+            i = start
+            while i < len(cond) and depth > 0:
+                if cond[i] == '(':
+                    depth += 1
+                elif cond[i] == ')':
+                    depth -= 1
+                i += 1
+            in_expr = cond[start:i-1].strip() if depth == 0 else cond[start:].strip()
             idx = self._resolve_col(col, col_names)
             if idx >= 0 and idx < len(row):
                 val = row[idx].strip("'\"").upper()
@@ -2469,6 +2632,12 @@ class MockDatabase:
                     elif op == '<=': return cv <= vv
                     elif op in ('<>', '!='): return cv != vv
                 except ValueError:
+                    cell_is_num = self._is_numeric(cell_val)
+                    rhs_is_num = self._is_numeric(rhs_val)
+                    if cell_is_num != rhs_is_num:
+                        if op == '=': return False
+                        elif op in ('<>', '!='): return True
+                        else: return False
                     cv_up = cell_val.upper()
                     vv_up = rhs_val.upper()
                     if op == '=': return cv_up == vv_up
@@ -2500,6 +2669,12 @@ class MockDatabase:
                     elif op == '<=': return cv <= vv
                     elif op in ('<>', '!='): return cv != vv
                 except ValueError:
+                    cell_is_num = self._is_numeric(cell_val)
+                    rhs_is_num = self._is_numeric(rhs_val)
+                    if cell_is_num != rhs_is_num:
+                        if op == '=': return False
+                        elif op in ('<>', '!='): return True
+                        else: return False
                     cv_up = cell_val.upper()
                     vv_up = rhs_val.upper()
                     if op == '=': return cv_up == vv_up
@@ -2639,39 +2814,75 @@ class MockDatabase:
             lines.append("no rows selected")
             return lines
 
-        # Compute column widths (at least as wide as header)
         widths = []
         for i, c in enumerate(col_names):
             max_w = len(c)
             for row in data:
                 if i < len(row):
                     max_w = max(max_w, len(str(row[i])))
-            widths.append(min(max_w + 2, 40))
+            widths.append(max(max_w, len(c)) if data else max_w)
 
-        # Header
         header = ""
         for i, c in enumerate(col_names):
-            header += f"{c:>{widths[i]}s} "
-        lines.append(header.rstrip())
+            header += f"{'  ' + c:>{widths[i] + 2}}"
+        lines.append(header)
 
-        # Separator
         sep = ""
         for w in widths:
-            sep += "-" * w + " "
-        lines.append(sep.rstrip())
+            sep += "  " + "-" * w
+        lines.append(sep)
 
-        # Data rows
         for row in data:
             row_str = ""
             for i, c in enumerate(col_names):
                 val = str(row[i]) if i < len(row) else ""
-                row_str += f"{val:>{widths[i]}s} "
-            lines.append(row_str.rstrip())
+                row_str += f"{'  ' + val:>{widths[i] + 2}}"
+            lines.append(row_str)
 
         row_count = len(data)
         lines.append("")
         lines.append(f"{row_count} row(s) selected.")
         return lines
+
+    def _parse_select_output_lines(self, lines: List[str]) -> Tuple[List[str], List[List[str]]]:
+        """Parse formatted SELECT output back into column names and data rows."""
+        data_lines = [l for l in lines if l.strip()]
+        if not data_lines:
+            return [], []
+        if re.search(r'\d+ row\(s\) selected\.', data_lines[-1]):
+            data_lines = data_lines[:-1]
+        if len(data_lines) < 2:
+            return [], []
+
+        sep = data_lines[1]
+        col_starts = []
+        col_ends = []
+        i = 0
+        while i < len(sep):
+            if sep[i] == '-':
+                start = i
+                while i < len(sep) and sep[i] == '-':
+                    i += 1
+                col_starts.append(start)
+                col_ends.append(i)
+            else:
+                i += 1
+        if not col_starts:
+            return [], []
+
+        col_names = []
+        for s, e in zip(col_starts, col_ends):
+            col_names.append(data_lines[0][s:e].strip())
+
+        data_rows = []
+        for line in data_lines[2:]:
+            row = []
+            for s, e in zip(col_starts, col_ends):
+                val = line[s:e].strip() if e <= len(line) else ''
+                row.append(val)
+            data_rows.append(row)
+
+        return col_names, data_rows
 
     def _execute_subquery(self, sql: str) -> List[str]:
         """Execute a subquery SELECT and return the first-column values as a flat list."""
@@ -2684,6 +2895,11 @@ class MockDatabase:
             return []
         table = parsed.from_tables[0].upper()
         if table not in self.tables:
+            if parsed.from_subqueries or table in self.views:
+                lines = self._handle_SELECT(parsed)
+                cols, rows = self._parse_select_output_lines(lines)
+                if rows:
+                    return [r[0] for r in rows if r]
             return []
         tcols = self.get_column_names(table)
         trows = self.rows.get(table, [])
@@ -2743,6 +2959,26 @@ class MockDatabase:
         rows = trows
         if parsed.where_clause:
             rows = self._apply_where(rows, tcols, table, parsed.where_clause)
+        # Handle GROUP BY
+        if parsed.group_by:
+            gb_col_names = list(tcols)
+            having_agg_cols = []
+            if parsed.having_clause:
+                for m in re.finditer(r'(SUM|COUNT|AVG|MIN|MAX)\s*\(([^)]*)\)', parsed.having_clause, re.IGNORECASE):
+                    hac = m.group(0).upper().strip()
+                    if hac not in gb_col_names:
+                        gb_col_names.append(hac)
+                        having_agg_cols.append(hac)
+            rows = self._apply_group_by(rows, gb_col_names, parsed, tcols)
+        # Handle HAVING
+        if parsed.having_clause and rows:
+            h_col_names = list(tcols)
+            if parsed.group_by:
+                for m in re.finditer(r'(SUM|COUNT|AVG|MIN|MAX)\s*\(([^)]*)\)', parsed.having_clause, re.IGNORECASE):
+                    hac = m.group(0).upper().strip()
+                    if hac not in h_col_names:
+                        h_col_names.append(hac)
+            rows = self._apply_having(rows, h_col_names, parsed)
         values = [str(r[ci]) for r in rows if ci < len(r)]
         return values
 
@@ -2751,14 +2987,22 @@ class MockDatabase:
         inner = sql.strip()
         if inner.startswith('(') and inner.endswith(')'):
             inner = inner[1:-1].strip()
-        values = self._execute_subquery(inner)
-        if values:
-            return values[0]
+        # Use full SELECT handler to support FROM subqueries, views, etc.
+        parsed = SQLParser.parse(inner)
+        if parsed and parsed.type == StatementType.SELECT:
+            lines = self._handle_SELECT(parsed)
+            cols, rows = self._parse_select_output_lines(lines)
+            if rows and cols:
+                return rows[0][0]
         return None
 
     def _evaluate_expression(self, expr: str, row: List[str], col_names: List[str]) -> str:
         """Evaluate simple arithmetic expressions like 'Stock + 10'."""
         expr = expr.strip().strip("'\"")
+        # Resolve sequence references (e.g. seq.NEXTVAL)
+        resolved = self._resolve_sequence_ref(expr)
+        if resolved != expr:
+            return resolved
         # Check for arithmetic
         try:
             # Simple: if it's a plain number, return it
@@ -2980,7 +3224,27 @@ class MockDatabase:
         self.sequences[stmt.sequence_name] = SequenceInfo(
             name=stmt.sequence_name, current_val=stmt.sequence_start,
             increment=stmt.sequence_increment)
+        self._last_sequence_nextvals[stmt.sequence_name] = None
         return ["", "Sequence created."]
+
+    def _resolve_sequence_ref(self, val: str) -> str:
+        m = re.match(r'\A(\w+)\.(NEXTVAL|CURRVAL)\Z', val.strip(), re.IGNORECASE)
+        if not m:
+            return val
+        seq_name = m.group(1).upper()
+        op = m.group(2).upper()
+        if seq_name not in self.sequences:
+            raise PLSQLError(-2204, f"sequence '{seq_name}.NEXTVAL' does not exist")
+        seq = self.sequences[seq_name]
+        if op == 'NEXTVAL':
+            new_val = str(seq.current_val)
+            seq.current_val += seq.increment
+            self._last_sequence_nextvals[seq_name] = new_val
+            return new_val
+        else:  # CURRVAL
+            if self._last_sequence_nextvals.get(seq_name) is None:
+                raise PLSQLError(-8002, f"{seq_name}.CURRVAL is not yet defined in this session")
+            return self._last_sequence_nextvals[seq_name]
 
     def _handle_EXEC(self, stmt: ParsedStatement) -> List[str]:
         name = stmt.exec_name.upper()
@@ -3228,7 +3492,7 @@ class SQLHighlighter:
 
 class LineNumbers(tk.Canvas):
     def __init__(self, parent, text_widget, font=None, **kwargs):
-        super().__init__(parent, width=45, bg=COLOR_LINE_NUM_BG,
+        super().__init__(parent, width=35, bg=COLOR_LINE_NUM_BG,
                          highlightthickness=0, **kwargs)
         self.text_widget = text_widget
         self.font = font or FONT
@@ -3256,10 +3520,14 @@ class LineNumbers(tk.Canvas):
         line_height = h[3] if h else 20
         y = 2
         for i in range(1, line_count + 1):
-            self.create_text(40, y, anchor='ne', text=str(i),
+            self.create_text(30, y, anchor='ne', text=str(i),
                              font=self.font, fill=COLOR_LINE_NUM_FG)
             y += line_height
         self.configure(height=max(y, 20))
+
+        x1, y1, x2, y2 = self.bbox('all') or (0, 0, 30, 20)
+        if x2 > 0:
+            self.configure(width=min(x2 + 6, 50))
 
 
 # ── Worksheet ──────────────────────────────────────────────────────
@@ -3379,27 +3647,50 @@ class OracleSQLLiteApp:
         help_menu.add_command(label="About Oracle SQL*Lite", command=self._show_about)
         help_menu.add_command(label="SQL Reference", command=self._show_sql_help)
 
+    @staticmethod
+    def _make_flat_button(parent, text, command, bg='#E0E0E0', fg='black',
+                          font=None, accent=False, padx=10, pady=4):
+        kwargs = dict(text=text, command=command, font=font,
+                      bg=bg, fg=fg, relief=tk.FLAT, bd=0,
+                      padx=padx, pady=pady, cursor='hand2',
+                      activebackground='#D0D0D0')
+        btn = tk.Button(parent, **kwargs)
+        if accent:
+            btn.configure(activebackground='#B0382A')
+        def _on_enter(e):
+            if e.widget['bg'] != COLOR_ACCENT:
+                e.widget['bg'] = '#D0D0D0'
+            else:
+                e.widget['bg'] = '#B0382A'
+        def _on_leave(e):
+            if e.widget['bg'] != '#B0382A':
+                e.widget['bg'] = bg
+            else:
+                e.widget['bg'] = COLOR_ACCENT
+        btn.bind('<Enter>', _on_enter)
+        btn.bind('<Leave>', _on_leave)
+        return btn
+
     def _build_toolbar(self):
-        toolbar = tk.Frame(self.root, bg=COLOR_BG, relief=tk.RAISED, bd=1)
+        toolbar = tk.Frame(self.root, bg=COLOR_BG, bd=0,
+                           highlightbackground=COLOR_BORDER, highlightthickness=1)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
-        btn_style = {'bg': '#E0E0E0', 'relief': tk.RAISED, 'bd': 1, 'padx': 8, 'pady': 2}
+        self._make_flat_button(toolbar, "▶ Execute", self._execute_sql,
+                               bg=COLOR_ACCENT, fg='white', font=self.font_bold,
+                               accent=True, padx=14, pady=4).pack(side=tk.LEFT, padx=3, pady=3)
 
-        tk.Button(toolbar, text="▶ Execute", command=self._execute_sql,
-                  font=self.font_bold, bg='#4CAF50', fg='white', relief=tk.RAISED, bd=1, padx=12, pady=2
-                  ).pack(side=tk.LEFT, padx=3, pady=3)
+        self._make_flat_button(toolbar, "✕ Clear Output", self._clear_output,
+                               padx=10, pady=4).pack(side=tk.LEFT, padx=3, pady=3)
 
-        tk.Button(toolbar, text="✕ Clear Output", command=self._clear_output,
-                  **btn_style).pack(side=tk.LEFT, padx=3, pady=3)
+        self._make_flat_button(toolbar, "📄 New WS", self._create_worksheet,
+                               padx=10, pady=4).pack(side=tk.LEFT, padx=3, pady=3)
 
-        tk.Button(toolbar, text="📄 New WS", command=self._create_worksheet,
-                  **btn_style).pack(side=tk.LEFT, padx=3, pady=3)
+        self._make_flat_button(toolbar, "🗑 Clear Editor", self._clear_editor,
+                               padx=10, pady=4).pack(side=tk.LEFT, padx=3, pady=3)
 
-        tk.Button(toolbar, text="🗑 Clear Editor", command=self._clear_editor,
-                  **btn_style).pack(side=tk.LEFT, padx=3, pady=3)
-
-        tk.Button(toolbar, text="❓ Help", command=self._show_sql_help,
-                  **btn_style).pack(side=tk.RIGHT, padx=3, pady=3)
+        self._make_flat_button(toolbar, "❓ Help", self._show_sql_help,
+                               padx=10, pady=4).pack(side=tk.RIGHT, padx=3, pady=3)
 
     def _build_left_panel(self):
         left_frame = tk.Frame(self.main_pane, bg=COLOR_BG, width=180)
@@ -3411,10 +3702,13 @@ class OracleSQLLiteApp:
         list_frame = tk.Frame(left_frame, bg=COLOR_BG)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
 
-        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL,
+                                 bg=COLOR_BORDER, activebackground='#BBBBBB',
+                                 troughcolor=COLOR_BG, bd=0, relief=tk.FLAT)
         self.ws_listbox = tk.Listbox(list_frame, font=self.font_normal,
                                      bg='white', fg='black', selectbackground='#0078D7',
-                                     selectforeground='white', bd=1, relief=tk.SUNKEN,
+                                     selectforeground='white', bd=1, relief=tk.FLAT,
+                                     highlightbackground=COLOR_BORDER, highlightthickness=1,
                                      yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.ws_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -3426,22 +3720,23 @@ class OracleSQLLiteApp:
 
         btn_frame = tk.Frame(left_frame, bg=COLOR_BG)
         btn_frame.pack(fill=tk.X, padx=5, pady=3)
-        tk.Button(btn_frame, text="＋ New", command=self._create_worksheet,
-                  bg='#E0E0E0', relief=tk.RAISED, bd=1, font=self.font_normal).pack(
-                      side=tk.LEFT, padx=2, fill=tk.X, expand=True)
-        tk.Button(btn_frame, text="✕ Close", command=self._close_worksheet,
-                  bg='#E0E0E0', relief=tk.RAISED, bd=1, font=self.font_normal).pack(
-                      side=tk.RIGHT, padx=2, fill=tk.X, expand=True)
+        self._make_flat_button(btn_frame, "＋ New", self._create_worksheet,
+                               padx=8, pady=3).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        self._make_flat_button(btn_frame, "✕ Close", self._close_worksheet,
+                               padx=8, pady=3).pack(side=tk.RIGHT, padx=2, fill=tk.X, expand=True)
 
     def _build_editor_area(self):
         editor_frame = tk.Frame(self.right_pane, bg='white')
         self.right_pane.add(editor_frame, weight=1)
 
         # Header bar showing active worksheet name
-        self.editor_header = tk.Label(editor_frame, text="WS 1",
-                                      font=self.font_bold, bg='#E8E8E8', fg='black',
-                                      anchor='w', padx=8, pady=2)
+        header_frame = tk.Frame(editor_frame, bg=COLOR_TAB_BG, bd=0,
+                                highlightbackground=COLOR_ACCENT, highlightthickness=2)
+        self.editor_header = tk.Label(header_frame, text="WS 1",
+                                      font=self.font_bold, bg=COLOR_TAB_ACTIVE, fg='black',
+                                      anchor='w', padx=10, pady=3)
         self.editor_header.pack(fill=tk.X)
+        header_frame.pack(fill=tk.X)
 
         # Editor panel with line numbers
         text_frame = tk.Frame(editor_frame, bg='white')
@@ -3459,12 +3754,16 @@ class OracleSQLLiteApp:
 
         # Scrollbar
         v_scroll = tk.Scrollbar(self.editor_text, orient=tk.VERTICAL,
-                                command=self.editor_text.yview)
+                                command=self.editor_text.yview,
+                                bg=COLOR_BORDER, activebackground='#BBBBBB',
+                                troughcolor=COLOR_BG, bd=0, relief=tk.FLAT)
         v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.editor_text.configure(yscrollcommand=v_scroll.set)
 
         h_scroll = tk.Scrollbar(editor_frame, orient=tk.HORIZONTAL,
-                                command=self.editor_text.xview)
+                                command=self.editor_text.xview,
+                                bg=COLOR_BORDER, activebackground='#BBBBBB',
+                                troughcolor=COLOR_BG, bd=0, relief=tk.FLAT)
         h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.editor_text.configure(xscrollcommand=h_scroll.set)
 
@@ -3487,9 +3786,12 @@ class OracleSQLLiteApp:
         self.right_pane.add(console_frame, weight=1)
 
         # Header
-        tk.Label(console_frame, text="  Output Console", font=self.font_bold,
-                 bg='#E8E8E8', fg='black', anchor='w', padx=8, pady=2
+        out_header_frame = tk.Frame(console_frame, bg=COLOR_TAB_BG, bd=0,
+                                    highlightbackground=COLOR_BORDER, highlightthickness=1)
+        tk.Label(out_header_frame, text="  Output Console", font=self.font_bold,
+                 bg=COLOR_TAB_BG, fg='black', anchor='w', padx=10, pady=3
                  ).pack(fill=tk.X)
+        out_header_frame.pack(fill=tk.X)
 
         out_frame = tk.Frame(console_frame, bg=COLOR_OUTPUT_BG)
         out_frame.pack(fill=tk.BOTH, expand=True)
@@ -3501,7 +3803,9 @@ class OracleSQLLiteApp:
         self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         out_scroll = tk.Scrollbar(self.output_text, orient=tk.VERTICAL,
-                                  command=self.output_text.yview)
+                                  command=self.output_text.yview,
+                                  bg=COLOR_BORDER, activebackground='#BBBBBB',
+                                  troughcolor=COLOR_BG, bd=0, relief=tk.FLAT)
         out_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.output_text.configure(yscrollcommand=out_scroll.set)
 
@@ -3514,7 +3818,8 @@ class OracleSQLLiteApp:
         self.output_text.tag_configure("ws_label", foreground='#555555', font=self.font_italic)
 
     def _build_status_bar(self):
-        bar_frame = tk.Frame(self.root, bg=COLOR_STATUS_BG, relief=tk.SUNKEN, bd=1)
+        bar_frame = tk.Frame(self.root, bg=COLOR_STATUS_BG, bd=0,
+                             highlightbackground=COLOR_BORDER, highlightthickness=1)
         bar_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.status_bar = tk.Label(bar_frame, text="Connected to: Oracle Database 19c  |  Ready",
@@ -3686,35 +3991,39 @@ class OracleSQLLiteApp:
         self.search_entry.select_range(0, tk.END)
 
     def _build_search_bar(self):
-        self.search_frame = tk.Frame(self.root, bg='#E0E0E0', bd=1, relief=tk.RAISED)
-        tk.Label(self.search_frame, text="Find:", bg='#E0E0E0',
+        sbg = '#F0F0F0'
+        self.search_frame = tk.Frame(self.root, bg=sbg, bd=0,
+                                     highlightbackground=COLOR_BORDER, highlightthickness=1)
+        tk.Label(self.search_frame, text="Find:", bg=sbg,
                  font=self.font_normal).pack(side=tk.LEFT, padx=(8, 2))
-        self.search_entry = tk.Entry(self.search_frame, width=25, font=self.font_normal)
-        self.search_entry.pack(side=tk.LEFT, padx=2)
+        self.search_entry = tk.Entry(self.search_frame, width=25, font=self.font_normal,
+                                     relief=tk.FLAT, bd=1, highlightthickness=0)
+        self.search_entry.pack(side=tk.LEFT, padx=2, pady=4)
         self.search_entry.bind('<Return>', self._find_next)
         self.search_entry.bind('<Escape>', lambda e: self._toggle_search())
 
-        tk.Button(self.search_frame, text="▼ Next", font=self.font_normal,
-                  command=self._find_next).pack(side=tk.LEFT, padx=1)
-        tk.Button(self.search_frame, text="▲ Prev", font=self.font_normal,
-                  command=self._find_prev).pack(side=tk.LEFT, padx=1)
+        self._make_flat_button(self.search_frame, "▼ Next", self._find_next,
+                               bg=sbg, padx=6, pady=2).pack(side=tk.LEFT, padx=1)
+        self._make_flat_button(self.search_frame, "▲ Prev", self._find_prev,
+                               bg=sbg, padx=6, pady=2).pack(side=tk.LEFT, padx=1)
 
-        tk.Label(self.search_frame, text="  Replace:", bg='#E0E0E0',
+        tk.Label(self.search_frame, text="  Replace:", bg=sbg,
                  font=self.font_normal).pack(side=tk.LEFT, padx=(8, 2))
-        self.replace_entry = tk.Entry(self.search_frame, width=18, font=self.font_normal)
-        self.replace_entry.pack(side=tk.LEFT, padx=2)
+        self.replace_entry = tk.Entry(self.search_frame, width=18, font=self.font_normal,
+                                      relief=tk.FLAT, bd=1, highlightthickness=0)
+        self.replace_entry.pack(side=tk.LEFT, padx=2, pady=4)
         self.replace_entry.bind('<Return>', self._replace_next)
 
-        tk.Button(self.search_frame, text="Replace", font=self.font_normal,
-                  command=self._replace_next).pack(side=tk.LEFT, padx=1)
-        tk.Button(self.search_frame, text="Replace All", font=self.font_normal,
-                  command=self._replace_all).pack(side=tk.LEFT, padx=1)
+        self._make_flat_button(self.search_frame, "Replace", self._replace_next,
+                               bg=sbg, padx=6, pady=2).pack(side=tk.LEFT, padx=1)
+        self._make_flat_button(self.search_frame, "Replace All", self._replace_all,
+                               bg=sbg, padx=6, pady=2).pack(side=tk.LEFT, padx=1)
 
-        self.search_match_label = tk.Label(self.search_frame, text="", bg='#E0E0E0', font=self.font_normal)
+        self.search_match_label = tk.Label(self.search_frame, text="", bg=sbg, font=self.font_normal)
         self.search_match_label.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(self.search_frame, text="✕", font=self.font_normal, bd=0,
-                  command=self._toggle_search).pack(side=tk.RIGHT, padx=4)
+        self._make_flat_button(self.search_frame, "✕", self._toggle_search,
+                               bg=sbg, padx=6, pady=2).pack(side=tk.RIGHT, padx=4)
 
     def _find_all_matches(self):
         search_term = self.search_entry.get()
@@ -4019,12 +4328,34 @@ class OracleSQLLiteApp:
     # ── Dialogs ────────────────────────────────────────────────────
 
     def _show_about(self):
-        messagebox.showinfo("About Oracle SQL*Lite",
-                            "Oracle SQL*Lite v1.0\n\n"
-                            "An Oracle DBMS simulator for educational use.\n"
-                            "Built with Python tkinter.\n\n"
-                            "Supports SQL and PL/SQL syntax with realistic-looking output.",
-                            parent=self.root)
+        win = tk.Toplevel(self.root)
+        win.title("About Oracle SQL*Lite")
+        win.geometry("380x260")
+        win.resizable(False, False)
+        win.configure(bg=COLOR_BG)
+
+        accent_bar = tk.Frame(win, bg=COLOR_ACCENT, height=4)
+        accent_bar.pack(fill=tk.X)
+
+        tk.Label(win, text="Oracle SQL*Lite",
+                 font=('Segoe UI', 18, 'bold'), bg=COLOR_BG, fg=COLOR_ACCENT
+                 ).pack(pady=(20, 2))
+        tk.Label(win, text="v1.0",
+                 font=self.font_normal, bg=COLOR_BG, fg='#666666'
+                 ).pack()
+        tk.Label(win, text="An Oracle DBMS simulator for educational use.\n"
+                           "Built with Python tkinter.\n"
+                           "Supports SQL and PL/SQL syntax with realistic-looking output.",
+                 font=self.font_normal, bg=COLOR_BG, fg='#333333',
+                 justify=tk.CENTER).pack(pady=12)
+        tk.Label(win, text="Copyright \u00A9 2025",
+                 font=self.font_normal, bg=COLOR_BG, fg='#888888'
+                 ).pack()
+
+        btn_frame = tk.Frame(win, bg=COLOR_BG)
+        btn_frame.pack(fill=tk.X, pady=(10, 15))
+        self._make_flat_button(btn_frame, "Close", win.destroy,
+                               accent=True).pack()
 
     def _show_sql_help(self):
         help_text = (
@@ -4064,12 +4395,28 @@ class OracleSQLLiteApp:
         )
         msg = tk.Toplevel(self.root)
         msg.title("SQL Reference")
-        msg.geometry("600x500")
-        text = tk.Text(msg, font=self.font_normal, wrap=tk.WORD, padx=10, pady=10)
+        msg.geometry("620x540")
+        msg.configure(bg=COLOR_BG)
+        msg.minsize(400, 300)
+
+        accent_bar = tk.Frame(msg, bg=COLOR_ACCENT, height=4)
+        accent_bar.pack(fill=tk.X)
+
+        text_frame = tk.Frame(msg, bg=COLOR_BG)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
+
+        text = tk.Text(text_frame, font=self.font_normal, wrap=tk.WORD,
+                       bg='white', fg='black', bd=1, relief=tk.FLAT,
+                       highlightbackground=COLOR_BORDER, highlightthickness=1,
+                       padx=12, pady=10)
         text.pack(fill=tk.BOTH, expand=True)
         text.insert("1.0", help_text)
         text.config(state=tk.DISABLED)
-        tk.Button(msg, text="Close", command=msg.destroy).pack(pady=5)
+
+        btn_frame = tk.Frame(msg, bg=COLOR_BG)
+        btn_frame.pack(fill=tk.X, pady=(0, 10))
+        self._make_flat_button(btn_frame, "Close", msg.destroy,
+                               padx=20, pady=4).pack()
 
 
 # ── Entry Point ────────────────────────────────────────────────────
